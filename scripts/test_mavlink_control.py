@@ -5,6 +5,7 @@ PX4 MAVLink 飞行控制测试脚本
 
 功能: Zero3W 通过串口直接对 PX4 发送飞行控制指令。
       支持交互式菜单和自动测试序列。
+      --hud 模式通过后台遥测线程持续更新 HUD。
 
 硬件:  Zero3W UART3 (/dev/ttyS3) → PX4 TELEM1
 协议:  MAVLink v2, 115200 8N1
@@ -13,17 +14,20 @@ PX4 MAVLink 飞行控制测试脚本
   # 交互式菜单 (默认)
   python3 test_mavlink_control.py
 
+  # 带 HUD 显示
+  sudo python3 test_mavlink_control.py --hud
+
   # 自动测试序列
-  python3 test_mavlink_control.py --mode guided    # GUIDED 模式测试
-  python3 test_mavlink_control.py --mode offboard  # OFFBOARD 模式测试
-  python3 test_mavlink_control.py --mode full      # 完整测试 (GUIDED + OFFBOARD)
+  sudo python3 test_mavlink_control.py --mode guided
+  sudo python3 test_mavlink_control.py --mode offboard
+  sudo python3 test_mavlink_control.py --mode full
 
 安全:
   - 遥控器保持开启作为紧急备份 (打杆自动退出 OFFBOARD)
   - Ctrl+C 任何时候都会尝试 Land + Disarm
   - 地面不会执行 ARM (需要确认)
 
-依赖: pymavlink, pyserial
+依赖: pymavlink, pyserial, opencv-python, numpy
 """
 
 import argparse
@@ -33,6 +37,7 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 
 try:
     from pymavlink import mavutil
@@ -61,7 +66,7 @@ PX4_MODE = {
     "AUTO_TAKEOFF": 0x00140000,
     "AUTO_LAND":    0x00150000,
     "AUTO_FOLLOW":  0x00160000,
-    "GUIDED":       0x00040000,  # PX4 GUIDED = AUTO + 特定 sub-mode
+    "GUIDED":       0x00040000,
 }
 
 # MAVLink 常量
@@ -98,13 +103,9 @@ def status_emoji(ok):
 
 
 def px4_main_mode_name(custom_mode):
-    """从 PX4 custom_mode 提取主模式名。
-    PX4 的 custom_mode 编码因版本而异, 尝试多种位偏移。"""
-    # 尝试 bits 16-23 作为 main_mode (PX4 v1.13+ 常见)
+    """从 PX4 custom_mode 提取主模式名。"""
     main_v1 = (custom_mode >> 16) & 0xFF
     sub_v1  = (custom_mode >> 24) & 0xFF
-
-    # 也尝试 bits 0-7 (旧版 PX4)
     main_v0 = custom_mode & 0xFF
     sub_v0  = (custom_mode >> 8) & 0xFF
 
@@ -115,15 +116,13 @@ def px4_main_mode_name(custom_mode):
     }
     auto_subs = {4: "LOITER", 5: "LOITER", 8: "RTL", 20: "TAKEOFF", 21: "LAND", 22: "FOLLOW"}
 
-    # main_v1 非零且合理 → 用 v1 编码
     if 0 <= main_v1 <= 20:
         name = names.get(main_v1, f"MAIN{main_v1}")
-        if main_v1 == 3 or main_v1 == 4:
+        if main_v1 in (3, 4):
             sub_name = auto_subs.get(sub_v1, f"SUB{sub_v1}")
             return f"AUTO.{sub_name}"
         return name
 
-    # 回退到 v0
     name = names.get(main_v0, f"MAIN{main_v0}")
     if main_v0 == 3:
         sub_name = auto_subs.get(sub_v0, f"SUB{sub_v0}")
@@ -137,23 +136,15 @@ def mav_state_name(state):
             6: "EMERGENCY", 7: "POWEROFF", 8: "FLIGHT_TERMINATION"}.get(state, f"?{state}")
 
 
-# ============================================================
-# 辅助函数
-# ============================================================
-
 def _ned_motion_name(vx, vy, vz):
     """NED 速度 → 人类可读的运动描述"""
     parts = []
-    # 前后
     if vx > 0.1:   parts.append("FWD")
     elif vx < -0.1: parts.append("BACK")
-    # 左右
     if vy > 0.1:   parts.append("RIGHT")
     elif vy < -0.1: parts.append("LEFT")
-    # 上下
     if vz > 0.1:   parts.append("DOWN")
     elif vz < -0.1: parts.append("UP")
-    # 悬停
     if not parts:
         parts.append("HOVER")
     return "+".join(parts)
@@ -164,23 +155,45 @@ def _ned_motion_name(vx, vy, vz):
 # ============================================================
 
 class PX4Controller:
-    """PX4 飞行控制器 — 封装所有 MAVLink 控制指令"""
+    """PX4 飞行控制器 — 后台遥测线程 + 控制指令。
+
+    架构:
+      后台遥测线程 — 持续读串口 (parse_buffer) → 更新 _shared_telemetry
+      主线程 — 发指令 + 交互菜单，需要遥测时直接读共享缓存
+      HUD 线程 — 读共享缓存 → 渲染 → 写 /dev/fb0
+
+    串口只有一个读取者 (后台线程)，避免了数据竞争。
+    """
 
     def __init__(self, port=DEFAULT_PORT, baud=DEFAULT_BAUD):
         self.port = port
         self.baud = baud
         self.mav = None
-        self._last_heartbeat = None
-        self._last_attitude = None
-        self._last_local_pos = None
-        self._last_battery = None
-        self._last_sys_status = None
+        self._running = True
+
+        # ACK 队列 (后台遥测线程写入，主线程消费)
         self._ack_queue = []
         self._ack_lock = threading.Lock()
-        self._running = True
-        # HUD 共享数据 (由主线程更新, HUD 线程只读)
-        self._shared_telemetry = {"connected": False}
+
+        # ── 共享遥测 (后台遥测线程写入，HUD/主线程只读) ──
+        self._shared_telemetry = {
+            "connected": False,
+            "armed": None, "mode": None, "mode_name": "?",
+            "state": None, "state_name": "?",
+            "alt_rel": None, "vx": None, "vy": None, "vz": None,
+            "battery_v": None,
+            "roll": None, "pitch": None, "yaw": None,
+            "roll_deg": None, "pitch_deg": None, "yaw_deg": None,
+            "ekf_ok": None,
+        }
         self._telemetry_lock = threading.Lock()
+
+        # ── 后台遥测线程 ──
+        self._telemetry_thread = None
+        self._telemetry_running = False
+
+        # ── 日志缓存 ──
+        self._log_lines = deque(maxlen=20)
 
     # ── 连接 ──────────────────────────────────────────
 
@@ -201,122 +214,210 @@ class PX4Controller:
 
     def close(self):
         self._running = False
+        self.stop_telemetry_thread()
         if self.mav:
             self.mav.close()
+
+    # ── 后台遥测线程 ──────────────────────────────────
+
+    def start_telemetry_thread(self):
+        """启动后台遥测线程：持续读串口 → 解析 → 更新 _shared_telemetry。
+
+        该线程是串口的唯一读取者。所有 MAVLink 消息解析后
+        写入共享缓存，供 HUD 渲染线程和主线程使用。
+        """
+        if self._telemetry_running:
+            return
+        if self.mav is None:
+            print("[WARN] 串口未连接，无法启动遥测线程")
+            return
+
+        self._telemetry_running = True
+        self.mav.port.timeout = 0  # 非阻塞
+
+        def _loop():
+            parser = self.mav.mav
+            port = self.mav.port
+            while self._telemetry_running and self._running:
+                try:
+                    w = port.in_waiting
+                except Exception:
+                    w = 0
+                if w > 0:
+                    try:
+                        data = port.read(min(w, 2048))
+                        msgs = parser.parse_buffer(data)
+                        if msgs:
+                            for msg in msgs:
+                                self._on_telemetry_msg(msg)
+                    except Exception:
+                        pass
+                else:
+                    time.sleep(0.002)
+
+        self._telemetry_thread = threading.Thread(target=_loop, daemon=True)
+        self._telemetry_thread.start()
+        print("[INFO] 后台遥测线程已启动")
+
+    def stop_telemetry_thread(self):
+        self._telemetry_running = False
+        if self._telemetry_thread and self._telemetry_thread.is_alive():
+            self._telemetry_thread.join(timeout=2)
+
+    def _on_telemetry_msg(self, msg):
+        """解析单条 MAVLink 消息 → 更新共享缓存 + ACK 队列。"""
+        t = msg.get_type()
+
+        if t == "HEARTBEAT":
+            with self._telemetry_lock:
+                self._shared_telemetry["connected"] = True
+                self._shared_telemetry["armed"] = \
+                    (msg.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0
+                self._shared_telemetry["mode"] = msg.custom_mode
+                self._shared_telemetry["mode_name"] = px4_main_mode_name(msg.custom_mode)
+                self._shared_telemetry["state"] = msg.system_status
+                self._shared_telemetry["state_name"] = mav_state_name(msg.system_status)
+
+        elif t == "ATTITUDE":
+            with self._telemetry_lock:
+                self._shared_telemetry["roll"] = msg.roll
+                self._shared_telemetry["pitch"] = msg.pitch
+                self._shared_telemetry["yaw"] = msg.yaw
+                self._shared_telemetry["roll_deg"] = math.degrees(msg.roll)
+                self._shared_telemetry["pitch_deg"] = math.degrees(msg.pitch)
+                self._shared_telemetry["yaw_deg"] = math.degrees(msg.yaw)
+
+        elif t == "LOCAL_POSITION_NED":
+            with self._telemetry_lock:
+                self._shared_telemetry["vx"] = msg.vx
+                self._shared_telemetry["vy"] = msg.vy
+                self._shared_telemetry["vz"] = msg.vz
+
+        elif t == "GLOBAL_POSITION_INT":
+            with self._telemetry_lock:
+                self._shared_telemetry["alt_rel"] = msg.relative_alt / 1000.0
+
+        elif t == "BATTERY_STATUS":
+            if msg.voltages:
+                v = msg.voltages[0] / 1000.0
+                if v < 100:
+                    with self._telemetry_lock:
+                        self._shared_telemetry["battery_v"] = v
+
+        elif t == "ESTIMATOR_STATUS":
+            flags = getattr(msg, "health_flags", None) or getattr(msg, "flags", 0)
+            ekf_ok = (flags & 0x01) != 0 if flags else False
+            with self._telemetry_lock:
+                self._shared_telemetry["ekf_ok"] = ekf_ok
+
+        elif t == "COMMAND_ACK":
+            with self._ack_lock:
+                self._ack_queue.append({
+                    "command": msg.command,
+                    "result": msg.result,
+                })
+
+        elif t == "STATUSTEXT":
+            sev = {0: "E", 1: "A", 2: "C", 3: "ERR", 4: "WARN", 5: "N", 6: "INFO"}
+            text = msg.text[:50] if isinstance(msg.text, str) else str(msg.text)[:50]
+            hud = getattr(self, "_hud", None)
+            if hud:
+                hud._log(f"[{sev.get(msg.severity, '?')}] {text}")
+
+    def _log(self, text):
+        """写日志到 HUD"""
+        hud = getattr(self, "_hud", None)
+        if hud:
+            hud._log(text)
 
     # ── 心跳等待 ──────────────────────────────────────
 
     def wait_for_heartbeat(self, timeout=15):
+        """等待 PX4 心跳 (从共享缓存检查)。"""
         print(f"[INFO] 等待 PX4 心跳 (最多 {timeout}s)...")
-        msg = self.mav.recv_match(type="HEARTBEAT", blocking=True, timeout=timeout)
-        if msg is None:
-            print(f"  {status_emoji(False)} 超时: 未收到心跳")
-            return False
-        print(f"  {status_emoji(True)} 已连接 PX4 (sysid={msg.get_srcSystem()}, "
-              f"自驾仪=12(PX4), 类型=2(QUADROTOR))")
-        return True
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._telemetry_lock:
+                if self._shared_telemetry.get("connected"):
+                    tele = dict(self._shared_telemetry)
+                    print(f"  {status_emoji(True)} 已连接 PX4 "
+                          f"(mode={tele.get('mode_name', '?')}, "
+                          f"armed={'YES' if tele.get('armed') else 'NO'})")
+                    return True
+            time.sleep(0.2)
+        print(f"  {status_emoji(False)} 超时: 未收到心跳")
+        return False
 
     # ── 遥测读取 ──────────────────────────────────────
 
-    def read_telemetry(self, timeout=2.0):
-        """读取所有可用遥测，返回 dict"""
-        result = {
-            "armed": None,
-            "mode": None,
-            "mode_name": "?",
-            "state": None,
-            "state_name": "?",
-            "alt_rel": None,
-            "vx": None, "vy": None, "vz": None,
-            "battery_v": None,
-            "roll": None, "pitch": None, "yaw": None,
-        }
-        end = time.time() + timeout
-        while time.time() < end:
-            msg = self.mav.recv_match(blocking=True, timeout=0.3)
-            if msg is None:
-                continue
+    def read_telemetry(self, timeout=0.0):
+        """返回共享遥测缓存的原子快照。
 
-            t = msg.get_type()
-
-            if t == "HEARTBEAT":
-                result["armed"] = (msg.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0
-                result["mode"] = msg.custom_mode
-                result["mode_name"] = px4_main_mode_name(msg.custom_mode)
-                result["state"] = msg.system_status
-                result["state_name"] = mav_state_name(msg.system_status)
-
-            elif t == "ATTITUDE":
-                result["roll"] = msg.roll
-                result["pitch"] = msg.pitch
-                result["yaw"] = msg.yaw
-                result["roll_deg"] = math.degrees(msg.roll)
-                result["pitch_deg"] = math.degrees(msg.pitch)
-                result["yaw_deg"] = math.degrees(msg.yaw)
-
-            elif t == "LOCAL_POSITION_NED":
-                result["vx"] = msg.vx
-                result["vy"] = msg.vy
-                result["vz"] = msg.vz
-
-            elif t == "GLOBAL_POSITION_INT":
-                result["alt_rel"] = msg.relative_alt / 1000.0
-
-            elif t == "BATTERY_STATUS":
-                result["battery_v"] = msg.voltages[0] / 1000.0 if msg.voltages else None
-
-            elif t == "COMMAND_ACK":
-                with self._ack_lock:
-                    self._ack_queue.append({
-                        "command": msg.command,
-                        "result": msg.result,
-                    })
-
-        # 更新共享遥测 (HUD 线程读取)
+        后台遥测线程持续更新，此方法无需阻塞读串口。
+        timeout 参数保留以兼容旧调用。
+        """
         with self._telemetry_lock:
-            self._shared_telemetry.update(result)
-        return result
+            return dict(self._shared_telemetry)
 
     def print_status(self):
-        """打印当前飞控状态"""
-        tele = self.read_telemetry(timeout=1.5)
+        """打印当前飞控状态 (从共享缓存读取)"""
+        tele = self.read_telemetry()
         print_sep("飞控状态")
-        print(f"  Armed:         {'是' if tele['armed'] else '否'}")
-        print(f"  模式:          {tele['mode_name']} (0x{tele['mode']:08X})"
-              if tele['mode'] is not None else "  模式:          ?")
-        print(f"  系统状态:      {tele['state_name']} ({tele['state']})"
-              if tele['state'] is not None else "")
-        if tele['alt_rel'] is not None:
-            print(f"  相对高度:      {tele['alt_rel']:.1f} m")
-        if tele['vx'] is not None:
-            print(f"  速度 NED:      vx={tele['vx']:.1f}, vy={tele['vy']:.1f}, "
-                  f"vz={tele['vz']:.1f} m/s")
-        if tele['battery_v'] is not None:
-            print(f"  电池:          {tele['battery_v']:.1f} V")
-        if tele['roll'] is not None:
-            print(f"  姿态 (r/p/y):  {math.degrees(tele['roll']):.0f}° "
-                  f"{math.degrees(tele['pitch']):.0f}° "
-                  f"{math.degrees(tele['yaw']):.0f}°")
+        print(f"  Armed:         {'是' if tele.get('armed') else '否'}")
+        mode = tele.get("mode")
+        mode_name = tele.get("mode_name", "?")
+        if mode is not None:
+            print(f"  模式:          {mode_name} (0x{mode:08X})")
+        else:
+            print(f"  模式:          ?")
+        state = tele.get("state")
+        state_name = tele.get("state_name", "?")
+        if state is not None:
+            print(f"  系统状态:      {state_name} ({state})")
+        alt = tele.get("alt_rel")
+        if alt is not None:
+            print(f"  相对高度:      {alt:.1f} m")
+        vx = tele.get("vx")
+        if vx is not None:
+            print(f"  速度 NED:      vx={vx:.1f}, vy={tele.get('vy', 0):.1f}, "
+                  f"vz={tele.get('vz', 0):.1f} m/s")
+        bat = tele.get("battery_v")
+        if bat is not None:
+            print(f"  电池:          {bat:.1f} V")
+        roll = tele.get("roll")
+        if roll is not None:
+            print(f"  姿态 (r/p/y):  {math.degrees(roll):.0f}° "
+                  f"{math.degrees(tele.get('pitch', 0)):.0f}° "
+                  f"{math.degrees(tele.get('yaw', 0)):.0f}°")
+        ekf = tele.get("ekf_ok")
+        if ekf is not None:
+            print(f"  EKF:           {'OK' if ekf else 'OFF'}")
         print_sep()
         return tele
 
-    # ── 等待 COMMAND_ACK ──────────────────────────────
+    # ── COMMAND_ACK 队列操作 ──────────────────────────
+
+    def _drain_ack(self, command_id):
+        """从 ACK 队列中取指定命令的结果。返回 True/False/None。"""
+        with self._ack_lock:
+            for i, ack in enumerate(self._ack_queue):
+                if ack["command"] == command_id:
+                    ok = (ack["result"] == 0)  # MAV_RESULT_ACCEPTED
+                    self._ack_queue.pop(i)
+                    return ok
+        return None
 
     def wait_ack(self, command_id, timeout=5.0):
-        """等待特定 command 的 ACK，返回 True/False"""
-        start = time.time()
-        while time.time() - start < timeout:
-            with self._ack_lock:
-                for ack in self._ack_queue:
-                    if ack["command"] == command_id:
-                        ok = (ack["result"] == 0)  # MAV_RESULT_ACCEPTED
-                        self._ack_queue.remove(ack)
-                        return ok
-                self._ack_queue.clear()  # 超时前清过期 ack
+        """等待指定命令的 ACK (从共享队列读取)。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            result = self._drain_ack(command_id)
+            if result is not None:
+                return result
             time.sleep(0.1)
         return None  # 超时
 
-    # ── 模式切换 ──────────────────────────────────────
+    # ── HUD 命令日志 ──────────────────────────────────
 
     def _hud_log_cmd(self, cmd_name, result):
         """更新 HUD 命令状态"""
@@ -330,41 +431,28 @@ class PX4Controller:
             "cmd": cmd_name,
             "result": result,
         })
-        # 限制历史长度
         if len(cs["history"]) > 10:
             cs["history"] = cs["history"][-8:]
-        # HUD 日志
-        hud = getattr(self, "_hud", None)
-        if hud:
-            hud._log(f"TX: {cmd_name} -> {result}")
+        self._log(f"TX: {cmd_name} -> {result}")
+
+    # ── 模式切换 ──────────────────────────────────────
 
     def set_mode(self, mode_name):
-        """切换到指定 PX4 模式，返回 True/False"""
-        if mode_name.upper() == "GUIDED":
-            # GUIDED 不是独立主模式, 用 MAV_CMD_NAV_TAKEOFF 隐式进入
-            # 这里只检查是否已经是可接收 takeoff 的模式
-            custom_mode = 0x00040004  # PX4: main=4 (AUTO), sub=4
-        elif mode_name.upper() == "OFFBOARD":
-            custom_mode = 0x00060006
-        elif mode_name.upper() == "POSCTL":
-            custom_mode = 0x00030002
-        elif mode_name.upper() == "ALTCTL":
-            custom_mode = 0x00010001
-        elif mode_name.upper() == "STABILIZED":
-            custom_mode = 0x000E0007
-        elif mode_name.upper() == "MANUAL":
-            custom_mode = 0x00000000
-        elif mode_name.upper() == "RTL":
-            custom_mode = 0x00080008
-        elif mode_name.upper() == "LAND":
-            custom_mode = 0x00150015
-        elif mode_name.upper() == "LOITER":
-            custom_mode = 0x00050005
-        else:
+        """切换到指定 PX4 模式。通过共享遥测 + ACK 队列检测结果。"""
+        mode_upper = mode_name.upper()
+
+        mode_map = {
+            "GUIDED": 0x00040004, "OFFBOARD": 0x00060006,
+            "POSCTL": 0x00030002, "ALTCTL": 0x00010001,
+            "STABILIZED": 0x000E0007, "MANUAL": 0x00000000,
+            "RTL": 0x00080008, "LAND": 0x00150015, "LOITER": 0x00050005,
+        }
+        custom_mode = mode_map.get(mode_upper)
+        if custom_mode is None:
             print(f"[FAIL] 未知模式: {mode_name}")
             return False
 
-        print(f"[INFO] 切换模式 → {mode_name.upper()}...")
+        print(f"[INFO] 切换模式 → {mode_upper}...")
         self.mav.mav.command_long_send(
             1, 1,
             mavutil.mavlink.MAV_CMD_DO_SET_MODE,
@@ -373,32 +461,35 @@ class PX4Controller:
             custom_mode, 0, 0, 0, 0, 0,
         )
 
-        # 等待 ACK 确认
-        start = time.time()
-        while time.time() - start < 5.0:
-            msg = self.mav.recv_match(blocking=True, timeout=0.5)
-            if msg is None:
-                continue
-            if msg.get_type() == "COMMAND_ACK" and msg.command == 176:
-                if msg.result == 0:
-                    print(f"  {status_emoji(True)} SET_MODE ACCEPTED")
-                    time.sleep(0.5)
-                    return True
-                else:
-                    results = {1:"TEMP_REJECTED",2:"DENIED",3:"UNSUPPORTED",4:"FAILED"}
-                    print(f"  {status_emoji(False)} SET_MODE {results.get(msg.result, '?')}")
-                    return False
-            elif msg.get_type() == "HEARTBEAT":
-                # 同时检查 HEARTBEAT 中的模式是否已变化
-                main_now = (msg.custom_mode >> 16) & 0xFF
-                main_target = (custom_mode >> 16) & 0xFF
-                if main_now == main_target and main_target != 0:
-                    print(f"  {status_emoji(True)} 模式已切换为 {mode_name.upper()}")
-                    self._hud_log_cmd(f"SET_MODE {mode_name.upper()}", "ACCEPTED")
-                    return True
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            # 1) 检查 ACK 队列
+            ack = self._drain_ack(176)  # MAV_CMD_DO_SET_MODE
+            if ack is True:
+                print(f"  {status_emoji(True)} SET_MODE ACCEPTED")
+                time.sleep(0.3)
+                return True
+            elif ack is False:
+                print(f"  {status_emoji(False)} SET_MODE REJECTED")
+                self._hud_log_cmd(f"SET_MODE {mode_upper}", "REJECTED")
+                return False
+
+            # 2) 检查共享遥测中的模式是否已变化
+            with self._telemetry_lock:
+                current = self._shared_telemetry.get("mode_name", "?")
+            if mode_upper == "GUIDED" and "AUTO" in str(current):
+                print(f"  {status_emoji(True)} 模式已切换为 {current}")
+                self._hud_log_cmd(f"SET_MODE {mode_upper}", "ACCEPTED")
+                return True
+            if str(current).startswith(mode_upper) or str(current) == mode_upper:
+                print(f"  {status_emoji(True)} 模式已切换为 {current}")
+                self._hud_log_cmd(f"SET_MODE {mode_upper}", "ACCEPTED")
+                return True
+
+            time.sleep(0.2)
 
         print(f"  {status_emoji(False)} 模式切换超时")
-        self._hud_log_cmd(f"SET_MODE {mode_name.upper()}", "FAILED")
+        self._hud_log_cmd(f"SET_MODE {mode_upper}", "TIMEOUT")
         return False
 
     # ── Arm / Disarm ──────────────────────────────────
@@ -411,24 +502,26 @@ class PX4Controller:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 1, 0, 0, 0, 0, 0, 0,
         )
-        result = self.wait_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout=5.0)
-        if result is None:
-            # 有些固件不发 ACK，直接检查 HEARTBEAT
-            pass
-        time.sleep(1)
-        tele = self.read_telemetry(timeout=1.0)
-        if tele.get("armed"):
-            print(f"  {status_emoji(True)} ARM 成功")
-            self._hud_log_cmd("ARM", "ACCEPTED")
-            return True
-        elif result is False:
-            print(f"  {status_emoji(False)} ARM 被拒绝 (检查安全开关/GPS/电池)")
-            self._hud_log_cmd("ARM", "DENIED")
-            return False
-        else:
-            print(f"  {status_emoji(False)} ARM 状态未确认")
-            self._hud_log_cmd("ARM", "NO_ACK")
-            return False
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with self._telemetry_lock:
+                armed = self._shared_telemetry.get("armed")
+            if armed:
+                print(f"  {status_emoji(True)} ARM 成功")
+                self._hud_log_cmd("ARM", "ACCEPTED")
+                return True
+
+            ack = self._drain_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM)
+            if ack is False:
+                print(f"  {status_emoji(False)} ARM 被拒绝 (检查安全开关/GPS/电池)")
+                self._hud_log_cmd("ARM", "DENIED")
+                return False
+            time.sleep(0.2)
+
+        print(f"  {status_emoji(False)} ARM 状态未确认")
+        self._hud_log_cmd("ARM", "NO_ACK")
+        return False
 
     def disarm(self):
         """上锁"""
@@ -438,12 +531,17 @@ class PX4Controller:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 0, 0, 0, 0, 0, 0, 0,
         )
-        time.sleep(1)
-        tele = self.read_telemetry(timeout=1.0)
-        if not tele.get("armed", True):
-            print(f"  {status_emoji(True)} DISARM 成功")
-            self._hud_log_cmd("DISARM", "ACCEPTED")
-            return True
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with self._telemetry_lock:
+                armed = self._shared_telemetry.get("armed")
+            if armed is False:
+                print(f"  {status_emoji(True)} DISARM 成功")
+                self._hud_log_cmd("DISARM", "ACCEPTED")
+                return True
+            time.sleep(0.2)
+
         print(f"  {status_emoji(False)} DISARM 失败")
         self._hud_log_cmd("DISARM", "FAILED")
         return False
@@ -451,22 +549,19 @@ class PX4Controller:
     # ── Takeoff (GUIDED 模式) ─────────────────────────
 
     def takeoff(self, altitude_m=3.0):
-        """起飞到指定高度 (需要 GUIDED 模式)"""
+        """起飞到指定高度 (从共享遥测读取高度反馈)"""
         print(f"[INFO] Takeoff → {altitude_m:.1f} m...")
         self.mav.mav.command_long_send(
             1, 1,
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0,                    # confirmation
-            0, 0, 0, math.nan,    # param1-4: 忽略
-            0, 0,                 # param5-6: lat, lon (0=当前位置)
-            altitude_m,           # param7: 目标高度
+            0, 0, 0, 0, math.nan,
+            0, 0, altitude_m,
         )
 
-        # 等待达到高度
-        start = time.time()
-        while time.time() - start < 30.0:
-            tele = self.read_telemetry(timeout=0.5)
-            alt = tele.get("alt_rel")
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            with self._telemetry_lock:
+                alt = self._shared_telemetry.get("alt_rel")
             if alt is not None and alt >= altitude_m * 0.9:
                 print(f"  {status_emoji(True)} 达到目标高度 {alt:.1f} m")
                 self._hud_log_cmd(f"TAKEOFF {altitude_m:.0f}m", "ACCEPTED")
@@ -474,6 +569,7 @@ class PX4Controller:
             if alt is not None:
                 sys.stdout.write(f"\r  当前高度: {alt:.1f} m / {altitude_m:.1f} m  ")
                 sys.stdout.flush()
+            time.sleep(0.3)
         print(f"\n  {status_emoji(False)} Takeoff 超时")
         return False
 
@@ -506,7 +602,7 @@ class PX4Controller:
     # ── GUIDED 位置指令 ───────────────────────────────
 
     def goto_local_ned(self, x_m, y_m, z_m, yaw_rad=0):
-        """GUIDED 模式: 飞到一个相对 NED 位置"""
+        """GUIDED 模式: 飞到相对 NED 位置"""
         self.mav.mav.set_position_target_local_ned_send(
             0, 1, 1,
             mavutil.mavlink.MAV_FRAME_LOCAL_NED,
@@ -522,33 +618,26 @@ class PX4Controller:
     def send_offboard_velocity(self, vx, vy, vz, yaw_rate=0.0):
         """发送 OFFBOARD 速度指令 (NED 坐标系, 需要 ≥2Hz 持续发送)"""
         self.mav.mav.set_position_target_local_ned_send(
-            0,                    # time_boot_ms
-            1, 1,                 # target_system, target_component
+            0, 1, 1,
             mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            0b0000111111000111,   # type_mask: 只使用 VX,VY,VZ,YAW_RATE
-            0, 0, 0,             # 位置 (忽略)
-            vx, vy, vz,          # 速度
-            0, 0, 0,             # 加速度 (忽略)
-            0, yaw_rate,         # yaw (忽略), yaw_rate
+            0b0000111111000111,
+            0, 0, 0,
+            vx, vy, vz,
+            0, 0, 0,
+            0, yaw_rate,
         )
 
     def offboard_velocity_ramp(self, vx, vy, vz, yaw_rate, duration_s,
                                 ramp_time=0.3, freq_hz=15):
-        """
-        OFFBOARD 速度控制 (带缓启动/缓停):
-          vx, vy, vz:  目标速度 (m/s), NED 坐标系
-          yaw_rate:    偏航角速度 (rad/s)
-          duration_s:  持续时间 (秒)
-          ramp_time:   加速/减速时间 (秒)
-          freq_hz:     发送频率 (Hz)
-        """
+        """OFFBOARD 速度控制 (带缓启动/缓停)"""
         interval = 1.0 / freq_hz
         steps = int(duration_s / interval)
         ramp_steps = int(ramp_time / interval) if ramp_time > 0 else 1
 
-        print(f"[INFO] OFFBOARD 速度: vx={vx:.1f} vy={vy:.1f} vz={vz:.1f} "
+        desc = _ned_motion_name(vx, vy, vz)
+        print(f"[INFO] OFFBOARD 速度: {desc} vx={vx:.1f} vy={vy:.1f} vz={vz:.1f} "
               f"yaw_rate={yaw_rate:.2f}, 持续 {duration_s:.1f}s")
-        # 更新 HUD 当前速度
+
         cs = getattr(self, "_hud_cmd_state", None)
         if cs:
             cs["current_vel"] = {"vx": vx, "vy": vy, "vz": vz, "yaw_rate": yaw_rate}
@@ -557,18 +646,15 @@ class PX4Controller:
         for i in range(steps):
             if not self._running:
                 break
-
-            # 缓启动/缓停
             if i < ramp_steps:
-                scale = (i + 1) / ramp_steps  # 0 → 1
+                scale = (i + 1) / ramp_steps
             elif i >= steps - ramp_steps:
                 scale = (steps - i) / ramp_steps
             else:
                 scale = 1.0
 
             self.send_offboard_velocity(
-                vx * scale, vy * scale, vz * scale, yaw_rate * scale,
-            )
+                vx * scale, vy * scale, vz * scale, yaw_rate * scale)
 
             elapsed = time.time() - start
             sys.stdout.write(f"\r  速度 [{elapsed:.1f}s/{duration_s:.1f}s] "
@@ -580,25 +666,23 @@ class PX4Controller:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-        self.send_offboard_velocity(0, 0, 0, 0)  # 停止
-        # 更新 HUD 速度显示为 0
-        cs = getattr(self, "_hud_cmd_state", None)
+        self.send_offboard_velocity(0, 0, 0, 0)
         if cs:
             cs["current_vel"] = {"vx": 0, "vy": 0, "vz": 0, "yaw_rate": 0}
         print(f"\n  {status_emoji(True)} 速度控制完成 → 归零悬停")
-        desc = _ned_motion_name(vx, vy, vz)
-        self._hud_log_cmd(f"{desc} {dur:.1f}s ({vx:+.1f},{vy:+.1f},{vz:+.1f} m/s)", "DONE")
+        self._hud_log_cmd(f"{desc} {duration_s:.1f}s "
+                          f"({vx:+.1f},{vy:+.1f},{vz:+.1f} m/s)", "DONE")
 
     # ── OFFBOARD 心跳保活 ─────────────────────────────
 
     def start_offboard_heartbeat(self):
-        """启动后台 OFFBOARD 心跳 (维持 OFFBOARD 模式)"""
+        """启动后台 OFFBOARD 心跳 (20Hz 维持 OFFBOARD 模式)"""
         self._hb_running = True
 
         def _hb_loop():
             while self._hb_running:
-                self.send_offboard_velocity(0, 0, 0, 0)  # 零速度 = 悬停
-                time.sleep(0.05)  # 20Hz
+                self.send_offboard_velocity(0, 0, 0, 0)
+                time.sleep(0.05)
 
         self._hb_thread = threading.Thread(target=_hb_loop, daemon=True)
         self._hb_thread.start()
@@ -619,7 +703,6 @@ def test_guided(ctrl: PX4Controller):
     print_sep("GUIDED 模式测试")
 
     steps = [
-        # (名称, 函数, 参数)
         ("等待心跳",    ctrl.wait_for_heartbeat, []),
         ("查看状态",    ctrl.print_status, []),
         ("切 GUIDED",  ctrl.set_mode, ["GUIDED"]),
@@ -640,17 +723,15 @@ def test_guided(ctrl: PX4Controller):
             func(*args)
         except Exception as e:
             print(f"  {status_emoji(False)} 步骤失败: {e}")
-            # 紧急处理
             ctrl.land()
             return False
     return True
 
 
 def test_offboard(ctrl: PX4Controller):
-    """OFFBOARD 模式自动测试: 速度控制前后左右上下"""
+    """OFFBOARD 模式自动测试"""
     print_sep("OFFBOARD 模式测试")
 
-    # 切模式 + 启动心跳
     if not ctrl.set_mode("OFFBOARD"):
         return False
     ctrl.start_offboard_heartbeat()
@@ -660,7 +741,6 @@ def test_offboard(ctrl: PX4Controller):
         ctrl.stop_offboard_heartbeat()
         return False
 
-    # 只在地面做微小的速度测试 ← 安全!
     print(f"\n{'!' * 50}")
     print(f"  ⚠️  确认无人机已解锁且在地面/安全环境")
     print(f"{'!' * 50}\n")
@@ -671,18 +751,17 @@ def test_offboard(ctrl: PX4Controller):
         ctrl.stop_offboard_heartbeat()
         return False
 
-    # 序列: 上升 → 前进 → 后退 → 悬停 → Land
     maneuvers = [
-        (0.0, 0.0, -0.5, 0.0, 3.0),   # 上升 0.5m/s × 3s
-        (0.5, 0.0, 0.0, 0.0, 2.0),    # 前进 0.5m/s × 2s
-        (-0.5, 0.0, 0.0, 0.0, 2.0),   # 后退 0.5m/s × 2s
-        (0.0, 0.5, 0.0, 0.0, 2.0),    # 右移 0.5m/s × 2s
-        (0.0, -0.5, 0.0, 0.0, 2.0),   # 左移 0.5m/s × 2s
+        (0.0, 0.0, -0.5, 0.0, 3.0),
+        (0.5, 0.0, 0.0, 0.0, 2.0),
+        (-0.5, 0.0, 0.0, 0.0, 2.0),
+        (0.0, 0.5, 0.0, 0.0, 2.0),
+        (0.0, -0.5, 0.0, 0.0, 2.0),
     ]
 
     for vx, vy, vz, yr, dur in maneuvers:
         ctrl.offboard_velocity_ramp(vx, vy, vz, yr, dur, freq_hz=15)
-        time.sleep(0.5)  # 机动间隙
+        time.sleep(0.5)
 
     ctrl.offboard_velocity_ramp(0, 0, 0, 0, 1.0)
     ctrl.stop_offboard_heartbeat()
@@ -702,14 +781,15 @@ def interactive_menu(ctrl: PX4Controller):
 
     offboard_hb_active = False
 
-    while True:
-        tele = ctrl.read_telemetry(timeout=0.8)
+    while ctrl._running:
+        tele = ctrl.read_telemetry()
         armed = tele.get("armed", False)
         mode_name = tele.get("mode_name", "?")
 
-        print("\n" * 1)
+        print("\n")
         print("┌" + "─" * 48 + "┐")
-        print(f"│  PX4 飞行控制测试  │  {mode_name:<8}  {'ARMED' if armed else 'DISARMED':<8}  │")
+        print(f"│  PX4 飞行控制测试  │  {mode_name:<8}  "
+              f"{'ARMED' if armed else 'DISARMED':<8}  │")
         print("├" + "─" * 48 + "┤")
         print(f"│  [1] 刷新状态                                  │")
         print(f"│  [2] 切换模式 (GUIDED/OFFBOARD/POSCTL/MANUAL/RTL)│")
@@ -778,13 +858,15 @@ def interactive_menu(ctrl: PX4Controller):
 
         elif choice == "5" and armed:
             ctrl.land()
-            ctrl.stop_offboard_heartbeat()
-            offboard_hb_active = False
+            if offboard_hb_active:
+                ctrl.stop_offboard_heartbeat()
+                offboard_hb_active = False
 
         elif choice == "6" and armed:
             ctrl.rtl()
-            ctrl.stop_offboard_heartbeat()
-            offboard_hb_active = False
+            if offboard_hb_active:
+                ctrl.stop_offboard_heartbeat()
+                offboard_hb_active = False
 
         elif choice == "7" and armed:
             s = input("  输入 NED 偏移 (dx dy dz yaw_deg): ").strip()
@@ -833,6 +915,7 @@ def main():
   %(prog)s --mode guided            # 自动 GUIDED 测试
   %(prog)s --mode offboard          # 自动 OFFBOARD 测试
   %(prog)s --mode full              # 完整自动测试
+  %(prog)s --hud                    # 带 HUD 屏幕显示
   %(prog)s --port /dev/ttyS3 --baud 115200
         """,
     )
@@ -857,6 +940,9 @@ def main():
     if not ctrl.connect():
         return 1
 
+    # ── 启动后台遥测线程 (串口唯一读取者) ──
+    ctrl.start_telemetry_thread()
+
     # ── HUD 初始化 ──
     hud = None
     hud_cmd_state = {
@@ -874,18 +960,23 @@ def main():
                 print("  [HUD] HDMI 显示已启动")
                 hud._log("Control script started")
 
-                # 后台 HUD 刷新线程 (不读串口, 只渲染共享数据)
                 def _hud_loop():
+                    """HUD 刷新线程: 读共享缓存 → 渲染 → 写 fb (不碰串口)"""
+                    tick = 1.0 / 10
+                    next_tick = time.time()
                     while getattr(_hud_loop, "active", True):
-                        try:
-                            # 用 mutex 保护读共享数据
-                            with ctrl._telemetry_lock:
-                                hud_telemetry.update(ctrl._shared_telemetry)
-                            hud_telemetry["connected"] = True
-                            hud.update(hud_telemetry, hud_cmd_state)
-                        except Exception:
-                            pass
-                        time.sleep(0.1)  # 10Hz
+                        now = time.time()
+                        if now >= next_tick:
+                            try:
+                                with ctrl._telemetry_lock:
+                                    hud_telemetry.update(ctrl._shared_telemetry)
+                                hud_telemetry["connected"] = True
+                                hud.update(hud_telemetry, hud_cmd_state)
+                            except Exception:
+                                pass
+                            next_tick = now + tick
+                        else:
+                            time.sleep(0.01)
 
                 _hud_loop.active = True
                 hud_thread = threading.Thread(target=_hud_loop, daemon=True)
@@ -895,6 +986,8 @@ def main():
                 hud = None
         except ImportError:
             print("  [HUD] hud_renderer 模块未找到, 跳过")
+        except Exception as e:
+            print(f"  [HUD] 初始化异常: {e}")
 
     # 安全提示
     print(f"\n  {'!' * 48}")
@@ -919,7 +1012,6 @@ def main():
     signal.signal(signal.SIGINT, emergency_shutdown)
 
     try:
-        # 注入 HUD 到 PX4Controller (供 set_mode/arm 等方法更新命令状态)
         ctrl._hud_cmd_state = hud_cmd_state
         ctrl._hud = hud
 

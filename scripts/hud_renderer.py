@@ -14,7 +14,6 @@ Usage:
 
 import math
 import os
-import threading
 import time
 from collections import deque
 
@@ -352,161 +351,35 @@ class HUD:
             except Exception:
                 continue
         return None
-
-
 # ============================================================
-# Standalone test
+# Module usage
 # ============================================================
-
-def main():
-    import signal, sys
-    try:
-        from pymavlink import mavutil
-    except ImportError:
-        print("[FATAL] pymavlink not installed")
-        sys.exit(1)
-
-    PORT = "/dev/ttyS3"
-    BAUD = 115200
-
-    print("PX4 HUD Overlay")
-    hud = HUD()
-    if not hud.open():
-        print("[WARN] No framebuffer, console-only mode")
-
-    mav = mavutil.mavlink_connection(PORT, BAUD, source_system=255, source_component=1)
-    msg = mav.recv_match(type="HEARTBEAT", blocking=True, timeout=15)
-    if msg is None:
-        print("[FATAL] No heartbeat")
-        sys.exit(1)
-    hud._log("PX4 connected")
-    hud._log("TX: Hello, PX4!")
-    mav.mav.statustext_send(6, b"Hello, PX4!")
-
-    def shutdown(sig, frame):
-        hud._running = False
-    signal.signal(signal.SIGINT, shutdown)
-
-    tele = {"connected": True}
-    cmd_state = {"last_cmd": "-", "last_result": "-",
-                 "current_vel": {"vx":0,"vy":0,"vz":0,"yaw_rate":0}, "history": []}
-
-    mav.port.timeout = 0
-
-    print("Running... Ctrl+C to stop")
-
-    # ═══════════════════════════════════════════════════
-    # 线程 A: 串口读 + MAVLink 解析 (只更新 tele, 不碰 fb)
-    # ═══════════════════════════════════════════════════
-    def serial_loop():
-        parser = mav.mav
-        msg_count = {}
-        last_log = time.time()
-        last_mode = None
-        last_armed = None
-        while hud._running:
-            try:
-                w = mav.port.in_waiting
-            except Exception:
-                w = 0
-            if w > 0:
-                data = mav.port.read(min(w, 2048))
-                msgs = parser.parse_buffer(data)
-                if msgs:
-                    for msg in msgs:
-                        t = msg.get_type()
-                        msg_count[t] = msg_count.get(t, 0) + 1
-                        t = msg.get_type()
-                        if t == "HEARTBEAT":
-                            tele["armed"] = (msg.base_mode & 128) != 0
-                            tele["mode_raw"] = msg.custom_mode
-                            tele["mode_name"] = _mode_name(msg.custom_mode)
-                            tele["state"] = msg.system_status
-                            tele["state_name"] = _state_name(msg.system_status)
-                        elif t == "ATTITUDE":
-                            tele["roll_deg"] = math.degrees(msg.roll)
-                            tele["pitch_deg"] = math.degrees(msg.pitch)
-                            tele["yaw_deg"] = math.degrees(msg.yaw)
-                        elif t == "LOCAL_POSITION_NED":
-                            tele["vx"] = msg.vx; tele["vy"] = msg.vy; tele["vz"] = msg.vz
-                        elif t == "GLOBAL_POSITION_INT":
-                            tele["alt_rel"] = msg.relative_alt / 1000.0
-                        elif t == "BATTERY_STATUS":
-                            if msg.voltages:
-                                v = msg.voltages[0] / 1000.0
-                                if v < 100: tele["battery_v"] = v
-                        elif t == "ESTIMATOR_STATUS":
-                            flags = getattr(msg, "health_flags", None) or getattr(msg, "flags", 0)
-                            tele["ekf_ok"] = (flags & 0x01) != 0 if flags else False
-                        elif t == "STATUSTEXT":
-                            sev = {0:"E",1:"A",2:"C",3:"ERR",4:"WARN",5:"N",6:"INFO"}
-                            hud._log("[{}] {}".format(
-                                sev.get(msg.severity,"?"), msg.text[:50]))
-            else:
-                time.sleep(0.002)
-
-            # 模式/解锁状态变化 → 记日志
-            cur_mode = tele.get("mode_name")
-            cur_armed = tele.get("armed")
-            if cur_mode and cur_mode != last_mode:
-                hud._log("Mode: {}".format(cur_mode))
-                last_mode = cur_mode
-            if cur_armed is not None and cur_armed != last_armed:
-                hud._log("Armed: {}".format("YES" if cur_armed else "NO"))
-                last_armed = cur_armed
-
-            # 每 5 秒统计一次消息量
-            now = time.time()
-            if now - last_log > 5 and msg_count:
-                items = sorted(msg_count.items(), key=lambda x: -x[1])[:3]
-                hud._log("RX: {}".format(" ".join(
-                    "{}x{}".format(t, c) for t, c in items)))
-                msg_count = {}
-                last_log = now
-
-    # ═══════════════════════════════════════════════════
-    # 线程 B: HUD 渲染 + 写 fb (不碰串口)
-    # ═══════════════════════════════════════════════════
-    def hud_loop():
-        tick = 1.0 / 10
-        next_tick = time.time()
-        while hud._running:
-            now = time.time()
-            if now >= next_tick:
-                tele["connected"] = True
-                hud.update(tele, cmd_state)
-                next_tick = now + tick
-            else:
-                time.sleep(0.01)
-
-    t_serial = threading.Thread(target=serial_loop, daemon=True)
-    t_hud    = threading.Thread(target=hud_loop, daemon=True)
-    t_serial.start()
-    t_hud.start()
-
-    # 主线程等待 (Ctrl+C 设 hud._running=False)
-    while hud._running:
-        time.sleep(0.5)
-
-    hud.close()
-    print("Done.")
-
-
-def _mode_name(cm):
-    main = (cm >> 16) & 0xFF; sub = (cm >> 24) & 0xFF
-    names = {0:"MAN",1:"ALT",2:"POS",3:"AUTO",4:"AUTO",5:"LOIT",6:"OFFB",7:"STAB",8:"RATT"}
-    # PX4 AUTO sub-modes (按固件版本可能略有差异)
-    subs = {0:"MISSION", 1:"READY", 2:"HOLD", 3:"LOITER",
-            4:"LOITER", 5:"LOITER", 8:"RTL", 20:"TKOFF", 21:"LAND", 22:"FOLLOW"}
-    n = names.get(main, "M{}".format(main))
-    if main in (3, 4):
-        return "{}.{}".format(n, subs.get(sub, "SUB{}".format(sub)))
-    return n
-
-def _state_name(s):
-    return {0:"UNINIT",1:"BOOT",2:"CAL",3:"STBY",4:"ACT",5:"CRIT",6:"EMERG",
-            7:"PWROFF",8:"TERM"}.get(s,"?{}".format(s))
+#
+# This is a pure rendering library. It does NOT touch serial ports.
+# Import HUD from test_mavlink_control.py or any other data source:
+#
+#   from hud_renderer import HUD
+#   hud = HUD()
+#   hud.open()
+#   hud.update(telemetry_dict, cmd_state_dict)
+#
 
 
 if __name__ == "__main__":
-    main()
+    # Standalone smoke test: render 10 frames with fake data
+    print("hud_renderer: pure rendering library (no serial I/O)")
+    hud = HUD()
+    if hud.open():
+        fake_tele = {"connected": True, "mode_name": "STBY", "armed": False,
+                     "state_name": "STBY", "roll_deg": 0, "pitch_deg": 0, "yaw_deg": 0,
+                     "alt_rel": 0, "vx": 0, "vy": 0, "vz": 0, "battery_v": 16.8,
+                     "ekf_ok": True}
+        fake_cmd = {"last_cmd": "-", "last_result": "-",
+                    "current_vel": {"vx":0,"vy":0,"vz":0,"yaw_rate":0}, "history": []}
+        for i in range(10):
+            hud.update(fake_tele, fake_cmd)
+            time.sleep(0.1)
+        hud.close()
+        print("Smoke test done.")
+    else:
+        print("No framebuffer available.")

@@ -1,0 +1,29 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.elf
+*.bin
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compiled output
+balloon_tracker
+
+# Dependencies
+third_party/mavlink_v2/
